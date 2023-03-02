@@ -239,7 +239,7 @@ void sdsclear(sds s) {
 sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
     void *sh, *newsh;
     size_t avail = sdsavail(s);
-    size_t len, newlen;
+    size_t len, newlen, reqlen;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
     int hdrlen;
     size_t usable;
@@ -249,7 +249,7 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
 
     len = sdslen(s);
     sh = (char*)s-sdsHdrSize(oldtype);
-    newlen = (len+addlen);
+    reqlen = newlen = (len+addlen);
     assert(newlen > len);   /* Catch size_t overflow */
     if (greedy == 1) {
         if (newlen < SDS_MAX_PREALLOC)
@@ -266,7 +266,7 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
 
     hdrlen = sdsHdrSize(type);
-    assert(hdrlen + newlen + 1 > len);  /* Catch size_t overflow */
+    assert(hdrlen + newlen + 1 > reqlen);  /* Catch size_t overflow */
     if (oldtype==type) {
         newsh = s_realloc_usable(sh, hdrlen+newlen+1, &usable);
         if (newsh == NULL) return NULL;
@@ -306,46 +306,20 @@ sds sdsMakeRoomForNonGreedy(sds s, size_t addlen) {
  *
  * After the call, the passed sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call. */
-sds sdsRemoveFreeSpace(sds s) {
-    void *sh, *newsh;
-    char type, oldtype = s[-1] & SDS_TYPE_MASK;
-    int hdrlen, oldhdrlen = sdsHdrSize(oldtype);
-    size_t len = sdslen(s);
-    size_t avail = sdsavail(s);
-    sh = (char*)s-oldhdrlen;
-
-    /* Return ASAP if there is no space left. */
-    if (avail == 0) return s;
-
-    /* Check what would be the minimum SDS header that is just good enough to
-     * fit this string. */
-    type = sdsReqType(len);
-    hdrlen = sdsHdrSize(type);
-
-    /* If the type is the same, or at least a large enough type is still
-     * required, we just realloc(), letting the allocator to do the copy
-     * only if really needed. Otherwise if the change is huge, we manually
-     * reallocate the string to use the different header type. */
-    if (oldtype==type || type > SDS_TYPE_8) {
-        newsh = s_realloc(sh, oldhdrlen+len+1);
-        if (newsh == NULL) return NULL;
-        s = (char*)newsh+oldhdrlen;
-    } else {
-        newsh = s_malloc(hdrlen+len+1);
-        if (newsh == NULL) return NULL;
-        memcpy((char*)newsh+hdrlen, s, len+1);
-        s_free(sh);
-        s = (char*)newsh+hdrlen;
-        s[-1] = type;
-        sdssetlen(s, len);
-    }
-    sdssetalloc(s, len);
-    return s;
+sds sdsRemoveFreeSpace(sds s, int would_regrow) {
+    return sdsResize(s, sdslen(s), would_regrow);
 }
 
 /* Resize the allocation, this can make the allocation bigger or smaller,
- * if the size is smaller than currently used len, the data will be truncated */
-sds sdsResize(sds s, size_t size) {
+ * if the size is smaller than currently used len, the data will be truncated.
+ *
+ * The when the would_regrow argument is set to 1, it prevents the use of
+ * SDS_TYPE_5, which is desired when the sds is likely to be changed again.
+ *
+ * The sdsAlloc size will be set to the requested size regardless of the actual
+ * allocation size, this is done in order to avoid repeated calls to this
+ * function when the caller detects that it has excess space. */
+sds sdsResize(sds s, size_t size, int would_regrow) {
     void *sh, *newsh;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
     int hdrlen, oldhdrlen = sdsHdrSize(oldtype);
@@ -361,8 +335,10 @@ sds sdsResize(sds s, size_t size) {
     /* Check what would be the minimum SDS header that is just good enough to
      * fit this string. */
     type = sdsReqType(size);
-    /* Don't use type 5, it is not good for strings that are resized. */
-    if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+    if (would_regrow) {
+        /* Don't use type 5, it is not good for strings that are expected to grow back. */
+        if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+    }
     hdrlen = sdsHdrSize(type);
 
     /* If the type is the same, or can hold the size in it with low overhead
@@ -370,12 +346,23 @@ sds sdsResize(sds s, size_t size) {
      * to do the copy only if really needed. Otherwise if the change is
      * huge, we manually reallocate the string to use the different header
      * type. */
-    if (oldtype==type || (type < oldtype && type > SDS_TYPE_8)) {
-        newsh = s_realloc(sh, oldhdrlen+size+1);
+    int use_realloc = (oldtype==type || (type < oldtype && type > SDS_TYPE_8));
+    size_t newlen = use_realloc ? oldhdrlen+size+1 : hdrlen+size+1;
+    int alloc_already_optimal = 0;
+    #if defined(USE_JEMALLOC)
+        /* je_nallocx returns the expected allocation size for the newlen.
+         * We aim to avoid calling realloc() when using Jemalloc if there is no
+         * change in the allocation size, as it incurs a cost even if the
+         * allocation size stays the same. */
+        alloc_already_optimal = (je_nallocx(newlen, 0) == zmalloc_size(sh));
+    #endif
+
+    if (use_realloc && !alloc_already_optimal) {
+        newsh = s_realloc(sh, newlen);
         if (newsh == NULL) return NULL;
         s = (char*)newsh+oldhdrlen;
-    } else {
-        newsh = s_malloc(hdrlen+size+1);
+    } else if (!alloc_already_optimal) {
+        newsh = s_malloc(newlen);
         if (newsh == NULL) return NULL;
         memcpy((char*)newsh+hdrlen, s, len);
         s_free(sh);
@@ -827,7 +814,7 @@ sds sdstrim(sds s, const char *cset) {
     ep = end = s+sdslen(s)-1;
     while(sp <= end && strchr(cset, *sp)) sp++;
     while(ep > sp && strchr(cset, *ep)) ep--;
-    len = (sp > ep) ? 0 : ((ep-sp)+1);
+    len = (ep-sp)+1;
     if (s != sp) memmove(s, sp, len);
     s[len] = '\0';
     sdssetlen(s,len);
@@ -939,15 +926,13 @@ sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *c
     long start = 0, j;
     sds *tokens;
 
-    if (seplen < 1 || len < 0) return NULL;
-
+    if (seplen < 1 || len <= 0) {
+        *count = 0;
+        return NULL;
+    }
     tokens = s_malloc(sizeof(sds)*slots);
     if (tokens == NULL) return NULL;
 
-    if (len == 0) {
-        *count = 0;
-        return tokens;
-    }
     for (j = 0; j < (len-(seplen-1)); j++) {
         /* make sure there is room for the next element and the final one */
         if (slots < elements+2) {
@@ -999,6 +984,7 @@ void sdsfreesplitres(sds *tokens, int count) {
  * After the call, the modified sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call. */
 sds sdscatrepr(sds s, const char *p, size_t len) {
+    s = sdsMakeRoomFor(s, len + 2);
     s = sdscatlen(s,"\"",1);
     while(len--) {
         switch(*p) {
@@ -1013,7 +999,7 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         case '\b': s = sdscatlen(s,"\\b",2); break;
         default:
             if (isprint(*p))
-                s = sdscatprintf(s,"%c",*p);
+                s = sdscatlen(s, p, 1);
             else
                 s = sdscatprintf(s,"\\x%02x",(unsigned char)*p);
             break;
@@ -1021,6 +1007,26 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         p++;
     }
     return sdscatlen(s,"\"",1);
+}
+
+/* Returns one if the string contains characters to be escaped
+ * by sdscatrepr(), zero otherwise.
+ *
+ * Typically, this should be used to help protect aggregated strings in a way
+ * that is compatible with sdssplitargs(). For this reason, also spaces will be
+ * treated as needing an escape.
+ */
+int sdsneedsrepr(const sds s) {
+    size_t len = sdslen(s);
+    const char *p = s;
+
+    while (len--) {
+        if (*p == '\\' || *p == '"' || *p == '\n' || *p == '\r' ||
+            *p == '\t' || *p == '\a' || *p == '\b' || !isprint(*p) || isspace(*p)) return 1;
+        p++;
+    }
+
+    return 0;
 }
 
 /* Helper function for sdssplitargs() that returns non zero if 'c'
@@ -1314,10 +1320,10 @@ static sds sdsTestTemplateCallback(sds varname, void *arg) {
     else return NULL;
 }
 
-int sdsTest(int argc, char **argv, int accurate) {
+int sdsTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
-    UNUSED(accurate);
+    UNUSED(flags);
 
     {
         sds x = sdsnew("foo"), y;
@@ -1533,33 +1539,32 @@ int sdsTest(int argc, char **argv, int accurate) {
 
         /* Test sdsresize - extend */
         x = sdsnew("1234567890123456789012345678901234567890");
-        x = sdsResize(x, 200);
+        x = sdsResize(x, 200, 1);
         test_cond("sdsrezie() expand len", sdslen(x) == 40);
         test_cond("sdsrezie() expand strlen", strlen(x) == 40);
         test_cond("sdsrezie() expand alloc", sdsalloc(x) == 200);
         /* Test sdsresize - trim free space */
-        x = sdsResize(x, 80);
+        x = sdsResize(x, 80, 1);
         test_cond("sdsrezie() shrink len", sdslen(x) == 40);
         test_cond("sdsrezie() shrink strlen", strlen(x) == 40);
         test_cond("sdsrezie() shrink alloc", sdsalloc(x) == 80);
         /* Test sdsresize - crop used space */
-        x = sdsResize(x, 30);
+        x = sdsResize(x, 30, 1);
         test_cond("sdsrezie() crop len", sdslen(x) == 30);
         test_cond("sdsrezie() crop strlen", strlen(x) == 30);
         test_cond("sdsrezie() crop alloc", sdsalloc(x) == 30);
         /* Test sdsresize - extend to different class */
-        x = sdsResize(x, 400);
+        x = sdsResize(x, 400, 1);
         test_cond("sdsrezie() expand len", sdslen(x) == 30);
         test_cond("sdsrezie() expand strlen", strlen(x) == 30);
         test_cond("sdsrezie() expand alloc", sdsalloc(x) == 400);
         /* Test sdsresize - shrink to different class */
-        x = sdsResize(x, 4);
+        x = sdsResize(x, 4, 1);
         test_cond("sdsrezie() crop len", sdslen(x) == 4);
         test_cond("sdsrezie() crop strlen", strlen(x) == 4);
         test_cond("sdsrezie() crop alloc", sdsalloc(x) == 4);
         sdsfree(x);
     }
-    test_report();
     return 0;
 }
 #endif

@@ -158,6 +158,26 @@ start_server {tags {"pubsub network"}} {
         r pubsub numsub abc def
     } {abc 0 def 0}
 
+    test "NUMPATs returns the number of unique patterns" {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+
+        # Three unique patterns and one that overlaps
+        psubscribe $rd1 "foo*"
+        psubscribe $rd2 "foo*"
+        psubscribe $rd1 "bar*"
+        psubscribe $rd2 "baz*"
+
+        set patterns [r pubsub numpat]
+
+        # clean up clients
+        punsubscribe $rd1
+        punsubscribe $rd2
+        assert_equal 3 $patterns
+        $rd1 close
+        $rd2 close
+    }
+
     test "Mix SUBSCRIBE and PSUBSCRIBE" {
         set rd1 [redis_deferring_client]
         assert_equal {1} [subscribe $rd1 {foo.bar}]
@@ -369,5 +389,18 @@ start_server {tags {"pubsub network"}} {
         assert_equal {AK} [lindex [r config get notify-keyspace-events] 1]
         r config set notify-keyspace-events EA
         assert_equal {AE} [lindex [r config get notify-keyspace-events] 1]
+    }
+
+    test "Keyspace notifications: new key test" {
+        r config set notify-keyspace-events En
+        set rd1 [redis_deferring_client]
+        assert_equal {1} [psubscribe $rd1 *]
+        r set foo bar
+        # second set of foo should not cause a 'new' event
+        r set foo baz 
+        r set bar bar
+        assert_equal "pmessage * __keyevent@${db}__:new foo" [$rd1 read]
+        assert_equal "pmessage * __keyevent@${db}__:new bar" [$rd1 read]
+        $rd1 close
     }
 }
